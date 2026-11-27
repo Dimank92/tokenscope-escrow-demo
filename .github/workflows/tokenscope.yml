@@ -1,0 +1,140 @@
+name: TokenScope
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  security-events: write
+
+env:
+  TOKENSCOPE_REV: c03bf25a9f2a2611f6ce5e1dd09bb427c0ad0ee9
+  PLATFORM_TOOLS: v1.58
+
+jobs:
+  tokenscope:
+    name: Token-2022 checks (real SVM)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.99.0
+        run: rustup toolchain install 1.99.0 --profile minimal && rustup default 1.99.0
+
+      - name: Install build prerequisites
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config jq
+
+      - name: Restore tool cache
+        id: tools
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-build-sbf
+            ~/.cargo/bin/tokenscope
+            ~/.cache/solana/${{ env.PLATFORM_TOOLS }}
+          key: tools-${{ runner.os }}-sbf4.5.0-${{ env.PLATFORM_TOOLS }}-ts-${{ env.TOKENSCOPE_REV }}
+
+      - name: Install cargo-build-sbf 4.5.0
+        run: command -v cargo-build-sbf || cargo install cargo-build-sbf --version 4.5.0 --locked
+
+      - name: Install Solana platform-tools
+        run: |
+          set -eu
+          PT="$HOME/.cache/solana/$PLATFORM_TOOLS/platform-tools"
+          if [ ! -x "$PT/rust/bin/rustc" ]; then
+            curl -fsSL -o /tmp/pt.tar.bz2 "https://github.com/anza-xyz/platform-tools/releases/download/$PLATFORM_TOOLS/platform-tools-linux-x86_64.tar.bz2"
+            mkdir -p "$PT"
+            tar xjf /tmp/pt.tar.bz2 -C "$PT"
+          fi
+
+      - name: Install TokenScope
+        run: |
+          command -v tokenscope || cargo install --git https://github.com/integral-830/tokenscope \
+            --rev "$TOKENSCOPE_REV" tokenscope-cli --locked
+
+      - name: Build the escrow program
+        run: |
+          set -eu
+          PT="$HOME/.cache/solana/$PLATFORM_TOOLS/platform-tools"
+          unset RUSTFLAGS
+          cd programs/escrow
+          PATH="$PT/rust/bin:$PATH" RUSTC="$PT/rust/bin/rustc" \
+            cargo-build-sbf --no-rustup-override --skip-tools-install \
+            --tools-version "$PLATFORM_TOOLS" --sbf-out-dir ../../target/deploy
+          sha256sum ../../target/deploy/escrow.so
+
+      - name: Run TokenScope checks
+        run: |
+          mkdir -p results
+          status=0
+          for spec in tokenscope/*.json; do
+            name=$(basename "$spec" .json)
+            echo "::group::$name"
+            tokenscope sbf-run --spec "$spec" --format text --sarif "results/$name.sarif" \
+              | tee "results/$name.txt"
+            rc=${PIPESTATUS[0]}
+            [ "$rc" -eq 0 ] || status=$rc
+            echo "::endgroup::"
+          done
+          exit $status
+
+      - name: Save tool cache
+        if: always() && steps.tools.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-build-sbf
+            ~/.cargo/bin/tokenscope
+            ~/.cache/solana/${{ env.PLATFORM_TOOLS }}
+          key: ${{ steps.tools.outputs.cache-primary-key }}
+
+      - name: Merge SARIF
+        if: always()
+        run: |
+          jq -s '{
+            "$schema": .[0]["$schema"],
+            version: "2.1.0",
+            runs: [{
+              tool: { driver: (.[0].runs[0].tool.driver
+                + { rules: ([.[].runs[0].tool.driver.rules[]] | unique_by(.id)) }) },
+              results: [.[].runs[0].results[]]
+            }]
+          }' results/*.sarif > tokenscope.sarif
+
+      - name: Report findings
+        if: always()
+        run: |
+          # One annotation per finding, on the escrow source line the check points at.
+          jq -r '.runs[].results[] |
+            (if .level == "error" then "error" else "warning" end) as $lvl |
+            .locations[0].physicalLocation as $loc |
+            "::\($lvl) file=\($loc.artifactLocation.uri),line=\($loc.region.startLine),title=TokenScope \(.ruleId)::\(.message.text)"' \
+            tokenscope.sarif
+          {
+            echo "## TokenScope findings"
+            echo
+            echo "Program: Solana Foundation Anchor escrow (unmodified), executed in the Mollusk SVM with the real Token-2022 program."
+            echo
+            echo "| Rule | Level | Location | Finding |"
+            echo "|---|---|---|---|"
+            jq -r '.runs[].results[] | .locations[0].physicalLocation as $loc |
+              "| \(.ruleId) | \(.level) | `\($loc.artifactLocation.uri):\($loc.region.startLine)` | \(.message.text | gsub("[|]"; "/")) |"' \
+              tokenscope.sarif
+            for f in results/*.txt; do
+              echo
+              echo "### $(basename "$f" .txt)"
+              echo
+              echo '```'
+              cat "$f"
+              echo '```'
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload SARIF to code scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: tokenscope.sarif
+          category: tokenscope
