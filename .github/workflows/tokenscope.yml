@@ -26,8 +26,9 @@ jobs:
       - name: Install build prerequisites
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config jq
 
-      - name: Cache tools
-        uses: actions/cache@v4
+      - name: Restore tool cache
+        id: tools
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/bin/cargo-build-sbf
@@ -71,10 +72,23 @@ jobs:
           for spec in tokenscope/*.json; do
             name=$(basename "$spec" .json)
             echo "::group::$name"
-            tokenscope sbf-run --spec "$spec" --format text --sarif "results/$name.sarif" || status=$?
+            tokenscope sbf-run --spec "$spec" --format text --sarif "results/$name.sarif" \
+              | tee "results/$name.txt"
+            rc=${PIPESTATUS[0]}
+            [ "$rc" -eq 0 ] || status=$rc
             echo "::endgroup::"
           done
           exit $status
+
+      - name: Save tool cache
+        if: always() && steps.tools.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-build-sbf
+            ~/.cargo/bin/tokenscope
+            ~/.cache/solana/${{ env.PLATFORM_TOOLS }}
+          key: ${{ steps.tools.outputs.cache-primary-key }}
 
       - name: Merge SARIF
         if: always()
@@ -88,6 +102,35 @@ jobs:
               results: [.[].runs[0].results[]]
             }]
           }' results/*.sarif > tokenscope.sarif
+
+      - name: Report findings
+        if: always()
+        run: |
+          # One annotation per finding, on the escrow source line the check points at.
+          jq -r '.runs[].results[] |
+            (if .level == "error" then "error" else "warning" end) as $lvl |
+            .locations[0].physicalLocation as $loc |
+            "::\($lvl) file=\($loc.artifactLocation.uri),line=\($loc.region.startLine),title=TokenScope \(.ruleId)::\(.message.text)"' \
+            tokenscope.sarif
+          {
+            echo "## TokenScope findings"
+            echo
+            echo "Program: Solana Foundation Anchor escrow (unmodified), executed in the Mollusk SVM with the real Token-2022 program."
+            echo
+            echo "| Rule | Level | Location | Finding |"
+            echo "|---|---|---|---|"
+            jq -r '.runs[].results[] | .locations[0].physicalLocation as $loc |
+              "| \(.ruleId) | \(.level) | `\($loc.artifactLocation.uri):\($loc.region.startLine)` | \(.message.text | gsub("[|]"; "/")) |"' \
+              tokenscope.sarif
+            for f in results/*.txt; do
+              echo
+              echo "### $(basename "$f" .txt)"
+              echo
+              echo '```'
+              cat "$f"
+              echo '```'
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload SARIF to code scanning
         if: always()
